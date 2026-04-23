@@ -1,8 +1,6 @@
 # 🧠 Qtsumego — Quantum Go Life Analyzer
 ### Born Machine Variational Quantum Algorithm for Life-and-Death in Go
 
-![Logo](docs/logo.svg)
-
 Qtsumego è un framework ibrido **quantum–classical** per analizzare problemi di **vita/morte nel Go** utilizzando:
 
 - Born Machines (circuiti quantistici parametrizzati)
