@@ -13,6 +13,9 @@ Il progetto esplora un nuovo paradigma:
 
 ---
 
+⚛️ "If you think you understand quantum mechanics, you don't understand quantum mechanics." — R. Feynman
+🎯 "The beginning of wisdom is to call things by their right names." — Proverbio Cinese (adatto al Go!)
+
 ## 🚀 Funzionalità principali
 
 - ✔ Board 9×9 con catture, gruppi, libertà
