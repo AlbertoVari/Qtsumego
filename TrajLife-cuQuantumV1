@@ -1,0 +1,474 @@
+# Qtsumego Trajectory-Based Born Machine -- cuQuantum/CuPy version
+"""
+Trajectory-Based Quantum Go Life Analyzer
+----------------------------------------
+
+cuQuantum rewrite:
+- Keeps the Go-board and trajectory logic from TraiV1.py.
+- Keeps Qiskit only as a convenient circuit/ansatz builder.
+- Replaces qiskit.quantum_info.Statevector simulation with NVIDIA cuQuantum
+  tensor-network contraction on the GPU.
+
+Colab L4 / CUDA 12.8 setup:
+    %pip install -U cuquantum-cu12 cuquantum-python-cu12 cupy-cuda12x qiskit
+
+Important import path:
+    from cuquantum.tensornet import contract, CircuitToEinsum
+"""
+
+import itertools
+import time
+from typing import Dict, List, Tuple
+
+import numpy as np
+import cupy as cp
+
+from qiskit.circuit.library import RealAmplitudes
+from cuquantum.tensornet import contract, CircuitToEinsum
+
+
+# =========================================================
+# 1. BOARD UTILITIES
+# =========================================================
+
+LETTERS = "ABCDEFGHI"
+
+
+def coord_to_index(coord: str, board_size: int) -> int:
+    col = LETTERS.index(coord[0].upper())
+    row = int(coord[1:]) - 1
+    return row * board_size + col
+
+
+def index_to_coord(index: int, board_size: int) -> str:
+    row, col = divmod(index, board_size)
+    return f"{LETTERS[col]}{row + 1}"
+
+
+def get_neighbors(position: int, board_size: int) -> List[int]:
+    row, col = divmod(position, board_size)
+    neighbors = []
+
+    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        nr, nc = row + dr, col + dc
+        if 0 <= nr < board_size and 0 <= nc < board_size:
+            neighbors.append(nr * board_size + nc)
+
+    return neighbors
+
+
+# =========================================================
+# 2. GO BOARD
+# =========================================================
+
+class GoBoard:
+    EMPTY, BLACK, WHITE = 0, 1, 2
+
+    def __init__(self, board_size: int = 9):
+        self.size = board_size
+        self.board = np.zeros((board_size, board_size), dtype=int)
+
+    def copy(self) -> "GoBoard":
+        newb = GoBoard(self.size)
+        newb.board = self.board.copy()
+        return newb
+
+    def place_stone(self, coord: str, color: int) -> bool:
+        pos = coord_to_index(coord, self.size)
+        r, c = divmod(pos, self.size)
+
+        if self.board[r, c] != self.EMPTY:
+            return False
+
+        self.board[r, c] = color
+
+        self._remove_captured_groups(3 - color)
+        self._remove_captured_groups(color)
+
+        return True
+
+    def _get_group(self, start_pos: int) -> Tuple[List[int], int]:
+        color = self.board[start_pos // self.size, start_pos % self.size]
+
+        if color == self.EMPTY:
+            return [], self.EMPTY
+
+        queue = [start_pos]
+        visited = set()
+        group = []
+
+        while queue:
+            pos = queue.pop()
+
+            if pos in visited:
+                continue
+
+            visited.add(pos)
+
+            r, c = divmod(pos, self.size)
+
+            if self.board[r, c] == color:
+                group.append(pos)
+                queue.extend(get_neighbors(pos, self.size))
+
+        return group, color
+
+    def _count_liberties(self, group: List[int]) -> int:
+        liberties = set()
+
+        for pos in group:
+            for n in get_neighbors(pos, self.size):
+                r, c = divmod(n, self.size)
+                if self.board[r, c] == self.EMPTY:
+                    liberties.add(n)
+
+        return len(liberties)
+
+    def _remove_captured_groups(self, color: int) -> None:
+        visited = set()
+
+        for pos in range(self.size * self.size):
+            if pos in visited:
+                continue
+
+            r, c = divmod(pos, self.size)
+
+            if self.board[r, c] == color:
+                group, _ = self._get_group(pos)
+                visited.update(group)
+
+                if self._count_liberties(group) == 0:
+                    for g in group:
+                        gr, gc = divmod(g, self.size)
+                        self.board[gr, gc] = self.EMPTY
+
+    def get_group_liberties(self, coords: List[str]) -> int:
+        liberties = set()
+
+        for coord in coords:
+            pos = coord_to_index(coord, self.size)
+
+            for n in get_neighbors(pos, self.size):
+                r, c = divmod(n, self.size)
+                if self.board[r, c] == self.EMPTY:
+                    liberties.add(n)
+
+        return len(liberties)
+
+    def render(self) -> str:
+        symbols = {
+            self.EMPTY: '.',
+            self.BLACK: 'X',
+            self.WHITE: 'O',
+        }
+
+        lines = []
+
+        for r in range(self.size - 1, -1, -1):
+            row = " ".join(symbols[int(self.board[r, c])] for c in range(self.size))
+            lines.append(f"{r + 1:2d} {row}")
+
+        lines.append("   " + " ".join(LETTERS[:self.size]))
+
+        return "\n".join(lines)
+
+
+# =========================================================
+# 3. TRAJECTORY GENERATION
+# =========================================================
+
+
+def generate_trajectories(candidate_moves: List[str], depth: int = 3):
+    """
+    Generate tactical trajectories.
+
+    Example, depth=3:
+        (white_move, black_response, white_followup)
+    """
+    return list(itertools.product(candidate_moves, repeat=depth))
+
+
+# =========================================================
+# 4. cuQUANTUM BORN MACHINE
+# =========================================================
+
+class CuQuantumBornTrajectoryCircuit:
+    """
+    Born machine ansatz evaluated with cuQuantum tensor-network contraction.
+
+    Qiskit is used only to define the parameterized RealAmplitudes circuit.
+    The statevector is produced by cuQuantum on the GPU via CircuitToEinsum.
+    """
+
+    def __init__(
+        self,
+        num_states: int,
+        reps: int = 3,
+        entanglement: str = "full",
+        dtype: str = "complex64",
+    ):
+        self.num_states = num_states
+        self.num_qubits = int(np.ceil(np.log2(max(num_states, 2))))
+        self.state_dim = 2 ** self.num_qubits
+        self.dtype = dtype
+
+        self.circuit = RealAmplitudes(
+            self.num_qubits,
+            reps=reps,
+            entanglement=entanglement,
+        )
+        self.parameters = list(self.circuit.parameters)
+
+    @property
+    def num_parameters(self) -> int:
+        return len(self.parameters)
+
+    def _bound_circuit(self, params: np.ndarray):
+        params = np.asarray(params, dtype=float)
+        if params.shape[0] != self.num_parameters:
+            raise ValueError(
+                f"Expected {self.num_parameters} parameters, got {params.shape[0]}"
+            )
+        return self.circuit.assign_parameters(dict(zip(self.parameters, params)), inplace=False)
+
+    def statevector(self, params: np.ndarray) -> cp.ndarray:
+        """
+        Return the full GPU statevector as a CuPy array of length 2**num_qubits.
+        """
+        bound = self._bound_circuit(params)
+
+        converter = CircuitToEinsum(bound, dtype=self.dtype, backend="cupy")
+        expression, operands = converter.state_vector()
+
+        state = contract(expression, *operands)
+        return state.reshape(-1)
+
+    def probabilities(self, params: np.ndarray) -> cp.ndarray:
+        """
+        Return Born probabilities |psi|^2 on GPU.
+        Padded computational-basis states exist when num_states is not a power of 2.
+        """
+        state = self.statevector(params)
+        probs = cp.abs(state) ** 2
+        return probs / probs.sum()
+
+
+# =========================================================
+# 5. TRAJECTORY EVALUATOR
+# =========================================================
+
+class TrajectoryEvaluator:
+    def __init__(
+        self,
+        board: GoBoard,
+        group: List[str],
+        candidate_moves: List[str],
+        depth: int = 3,
+    ):
+        self.board = board
+        self.group = group
+        self.candidate_moves = candidate_moves
+        self.depth = depth
+
+        self.trajectories = generate_trajectories(candidate_moves, depth)
+        self.num_trajectories = len(self.trajectories)
+
+        self.born = CuQuantumBornTrajectoryCircuit(self.num_trajectories)
+
+        # Precompute trajectory scores once. The quantum probabilities change with theta,
+        # but the Go tactical score of each trajectory is deterministic here.
+        self.scores_cpu = np.array(
+            [self.evaluate_trajectory(t) for t in self.trajectories],
+            dtype=np.float32,
+        )
+        self.scores_gpu = cp.asarray(self.scores_cpu)
+
+        self.move_to_indices = {
+            move: cp.asarray(
+                [i for i, t in enumerate(self.trajectories) if t[0] == move],
+                dtype=cp.int32,
+            )
+            for move in self.candidate_moves
+        }
+
+        print(f"Generated {self.num_trajectories} trajectories")
+        print(f"Using {self.born.num_qubits} qubits")
+        print(f"State dimension: {self.born.state_dim}")
+        print(f"GPU: {cp.cuda.runtime.getDeviceProperties(0)['name'].decode()}")
+
+    # -----------------------------------------------------
+    # Tactical simulation
+    # -----------------------------------------------------
+
+    def evaluate_trajectory(self, trajectory) -> float:
+        board = self.board.copy()
+
+        # For depth=3 this is white, black, white.
+        # For other depths it alternates white/black/white/black/...
+        colors = [GoBoard.WHITE if i % 2 == 0 else GoBoard.BLACK for i in range(len(trajectory))]
+
+        for move, color in zip(trajectory, colors):
+            board.place_stone(move, color)
+
+        liberties = board.get_group_liberties(self.group)
+
+        # Tactical heuristic
+        if liberties >= 3:
+            return 1.0
+        if liberties == 2:
+            return 0.7
+        if liberties == 1:
+            return 0.2
+        return 0.0
+
+    # -----------------------------------------------------
+    # Born expectation value
+    # -----------------------------------------------------
+
+    def expectation(self, params: np.ndarray) -> float:
+        probs = self.born.probabilities(params)[: self.num_trajectories]
+        value = cp.dot(probs, self.scores_gpu)
+        return float(value.get())
+
+    # -----------------------------------------------------
+    # Aggregate move probabilities
+    # -----------------------------------------------------
+
+    def move_distribution(self, params: np.ndarray) -> Dict[str, float]:
+        probs = self.born.probabilities(params)[: self.num_trajectories]
+
+        move_probs = {}
+        for move, indices in self.move_to_indices.items():
+            if indices.size == 0:
+                move_probs[move] = 0.0
+            else:
+                move_probs[move] = float(cp.sum(probs[indices]).get())
+
+        return move_probs
+
+    def valid_probability_mass(self, params: np.ndarray) -> float:
+        """
+        Probability mass assigned to real trajectories, excluding padded states.
+        The original implementation ignored padded states; this helper makes the
+        padding effect visible.
+        """
+        probs = self.born.probabilities(params)[: self.num_trajectories]
+        return float(cp.sum(probs).get())
+
+
+# =========================================================
+# 6. OPTIMIZER
+# =========================================================
+
+class Optimizer:
+    def __init__(self, objective, nparams: int):
+        self.objective = objective
+        self.nparams = nparams
+
+    def optimize(
+        self,
+        theta: np.ndarray,
+        steps: int = 100,
+        lr: float = 0.15,
+        eps: float = 1e-2,
+    ):
+        history = []
+
+        for step in range(steps):
+            value = self.objective(theta)
+            history.append(value)
+
+            grad = np.zeros_like(theta)
+
+            for i in range(len(theta)):
+                plus = theta.copy()
+                minus = theta.copy()
+
+                plus[i] += eps
+                minus[i] -= eps
+
+                grad[i] = (self.objective(plus) - self.objective(minus)) / (2 * eps)
+
+            theta += lr * grad
+
+            if step % 10 == 0:
+                print(f"\nSTEP {step}")
+                print(f"Expectation = {value:.4f}")
+                print(f"Gradient norm = {np.linalg.norm(grad):.4f}")
+
+        return theta, history
+
+
+# =========================================================
+# 7. SETUP
+# =========================================================
+
+
+def setup_problem():
+    board = GoBoard(9)
+
+    black = ["F2", "G2", "H3", "H4"]
+    white = ["C3", "E3", "F3", "G3", "G5", "H5", "F6"]
+
+    for s in black:
+        board.place_stone(s, GoBoard.BLACK)
+
+    for s in white:
+        board.place_stone(s, GoBoard.WHITE)
+
+    group = black
+    candidates = ["F2", "G2", "H3", "H4"]
+                  
+    return board, group, candidates
+
+
+# =========================================================
+# 8. MAIN
+# =========================================================
+
+
+def main():
+    start = time.time()
+
+    board, group, candidates = setup_problem()
+
+    print(board.render())
+
+    evaluator = TrajectoryEvaluator(
+        board,
+        group,
+        candidates,
+        depth=3,
+    )
+
+    theta = np.random.default_rng(123).uniform(
+        0,
+        np.pi,
+        evaluator.born.num_parameters,
+    )
+
+    optimizer = Optimizer(
+        evaluator.expectation,
+        evaluator.born.num_parameters,
+    )
+
+    theta, history = optimizer.optimize(theta)
+
+    print("\n" + "=" * 60)
+    print("FINAL DISTRIBUTION")
+    print("=" * 60)
+
+    probs = evaluator.move_distribution(theta)
+
+    for move, p in sorted(probs.items(), key=lambda x: -x[1]):
+        print(f"{move}: {p:.4f} ({100 * p:.2f}%)")
+
+    best = max(probs, key=probs.get)
+
+    print("\nValid trajectory probability mass:", f"{evaluator.valid_probability_mass(theta):.4f}")
+    print("BEST MOVE:", best)
+    print(f"\nElapsed: {time.time() - start:.2f}s")
+
+
+if __name__ == "__main__":
+    main()
