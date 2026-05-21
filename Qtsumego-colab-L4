@@ -1,0 +1,439 @@
+# Cella 1  NVIDIA L4 
+# =============================================================================
+# !nvidia-smi
+# =============================================================================
+
+# Cella 2: Librerie
+# =============================================================================
+# !pip uninstall dask-cuda -y -q
+# !pip install qiskit cuquantum-cu12 cuquantum-python-cu12 cupy-cuda12x ipywidgets -q
+# import os
+# print("✅ Installazione pulita completata. Riavvio in corso...")
+# os.kill(os.getpid(), 9)
+# =============================================================================
+
+# Cella 3: Widget ON/OFF
+# =============================================================================
+# from google.colab import output
+# output.enable_custom_widget_manager()
+# =============================================================================
+# from google.colab import output
+# output.disable_custom_widget_manager()
+# =============================================================================
+
+# Cella 4: Codice Principale (FIXED TSUMEGO LOGIC & GRADIENT SATURATION)
+# =============================================================================
+# Qtsumego Trajectory-Based Born Machine - SMART CANDIDATES (FIXED)
+# =============================================================================
+
+%matplotlib inline
+import itertools, os, logging, gc, time
+from typing import Dict, List
+import numpy as np
+import cupy as cp
+from qiskit.circuit.library import real_amplitudes
+from qiskit.quantum_info import Statevector
+from google.colab import drive
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+import matplotlib.pyplot as plt
+
+# =============================================================================
+# FIX 1: SEED PER RIPRODUCIBILITÀ
+# =============================================================================
+SEED = 42
+np.random.seed(SEED)
+cp.random.seed(SEED)
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+DRIVE_DIR = "/content/drive/MyDrive/GoBornMachine_L4"
+os.makedirs(DRIVE_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.FileHandler(os.path.join(DRIVE_DIR, "training.log"), mode="a", encoding="utf-8"),
+              logging.StreamHandler()]
+)
+logger = logging.getLogger("BornMachine")
+
+# =============================================================================
+# BOARD UTILITIES (Invariato)
+# =============================================================================
+LETTERS = "ABCDEFGHI"
+
+def coord_to_index(coord: str, board_size: int) -> int:
+    return (int(coord[1:]) - 1) * board_size + LETTERS.index(coord[0].upper())
+
+def index_to_coord(index: int, board_size: int) -> str:
+    row, col = divmod(index, board_size)
+    return f"{LETTERS[col]}{row + 1}"
+
+def get_neighbors(position: int, board_size: int) -> List[int]:
+    row, col = divmod(position, board_size)
+    neighbors = []
+    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        nr, nc = row + dr, col + dc
+        if 0 <= nr < board_size and 0 <= nc < board_size:
+            neighbors.append(nr * board_size + nc)
+    return neighbors
+
+class GoBoard:
+    EMPTY, BLACK, WHITE = 0, 1, 2
+
+    def __init__(self, board_size: int = 9):
+        self.size = board_size
+        self.board = np.zeros((board_size, board_size), dtype=int)
+
+    def copy(self):
+        newb = GoBoard(self.size)
+        newb.board = self.board.copy()
+        return newb
+
+    def place_stone(self, coord: str, color: int) -> bool:
+        pos = coord_to_index(coord, self.size)
+        r, c = divmod(pos, self.size)
+        if self.board[r, c] != self.EMPTY:
+            return False
+        self.board[r, c] = color
+        self._remove_captured_groups(3 - color)
+        self._remove_captured_groups(color)
+        return True
+
+    def _get_group(self, start_pos: int):
+        color = self.board[start_pos // self.size, start_pos % self.size]
+        if color == self.EMPTY: return [], self.EMPTY
+        queue, visited, group = [start_pos], set(), []
+        while queue:
+            pos = queue.pop()
+            if pos in visited: continue
+            visited.add(pos)
+            r, c = divmod(pos, self.size)
+            if self.board[r, c] == color:
+                group.append(pos)
+                queue.extend(get_neighbors(pos, self.size))
+        return group, color
+
+    def _count_liberties(self, group: List[int]) -> int:
+        liberties = set()
+        for pos in group:
+            for n in get_neighbors(pos, self.size):
+                r, c = divmod(n, self.size)
+                if self.board[r, c] == self.EMPTY:
+                    liberties.add(n)
+        return len(liberties)
+
+    def _remove_captured_groups(self, color: int):
+        visited = set()
+        for pos in range(self.size * self.size):
+            if pos in visited: continue
+            r, c = divmod(pos, self.size)
+            if self.board[r, c] == color:
+                group, _ = self._get_group(pos)
+                visited.update(group)
+                if self._count_liberties(group) == 0:
+                    for g in group:
+                        gr, gc = divmod(g, self.size)
+                        self.board[gr, gc] = self.EMPTY
+
+    def get_group_liberties_coords(self, coords: List[str]) -> List[str]:
+        liberties = set()
+        for coord in coords:
+            pos = coord_to_index(coord, self.size)
+            for n in get_neighbors(pos, self.size):
+                r, c = divmod(n, self.size)
+                if self.board[r, c] == self.EMPTY:
+                    liberties.add(n)
+        return sorted([index_to_coord(idx, self.size) for idx in liberties])
+
+    def get_candidate_moves(self, target_group: List[str], expansion: int = 2) -> List[str]:
+        candidates = set()
+        for lib in self.get_group_liberties_coords(target_group):
+            candidates.add(lib)
+        for lib in list(candidates):
+            pos = coord_to_index(lib, self.size)
+            for n in get_neighbors(pos, self.size):
+                r, c = divmod(n, self.size)
+                if self.board[r, c] == self.EMPTY:
+                    candidates.add(index_to_coord(n, self.size))
+        for stone in target_group:
+            pos = coord_to_index(stone, self.size)
+            for n in get_neighbors(pos, self.size):
+                r, c = divmod(n, self.size)
+                if self.board[r, c] == self.EMPTY:
+                    candidates.add(index_to_coord(n, self.size))
+        if expansion >= 2:
+            extra = set()
+            for c in list(candidates):
+                pos = coord_to_index(c, self.size)
+                for n in get_neighbors(pos, self.size):
+                    r, c_pos = divmod(n, self.size)
+                    if self.board[r, c_pos] == self.EMPTY:
+                        extra.add(index_to_coord(n, self.size))
+            candidates.update(extra)
+        return sorted(list(candidates))
+
+    def render(self) -> str:
+        symbols = {self.EMPTY: '.', self.BLACK: 'X', self.WHITE: 'O'}
+        lines = []
+        for r in range(self.size - 1, -1, -1):
+            row = "  ".join(symbols[int(self.board[r, c])] for c in range(self.size))
+            lines.append(f"{r + 1:2d} {row}")
+        lines.append("   " + "  ".join(LETTERS[:self.size]))
+        return "\n".join(lines)
+
+# =============================================================================
+# BORN MACHINE
+# =============================================================================
+class CuQuantumBornTrajectoryCircuit:
+    def __init__(self, num_states: int, reps: int = 2, entanglement: str = "linear"):
+        self.num_states = num_states
+        self.num_qubits = int(np.ceil(np.log2(max(num_states, 2))))
+        self.reps = reps
+
+        self.circuit = real_amplitudes(
+            num_qubits=self.num_qubits,
+            reps=reps,
+            entanglement=entanglement,
+            insert_barriers=False
+        )
+
+        self.parameters = list(self.circuit.parameters)
+        self._num_params = len(self.parameters)
+        logger.info(f"✅ Circuito: {self._num_params} parametri | {self.num_qubits} qubit | reps={reps} | ent={entanglement}")
+
+    def bind_parameters(self, params: cp.ndarray):
+        params_cpu = cp.asnumpy(params).astype(np.float64)
+        if len(params_cpu) != self._num_params:
+            if len(params_cpu) < self._num_params:
+                params_cpu = np.pad(params_cpu, (0, self._num_params - len(params_cpu)))
+            else:
+                params_cpu = params_cpu[:self._num_params]
+        return self.circuit.assign_parameters(params_cpu, inplace=False)
+
+    def probabilities(self, params: cp.ndarray) -> cp.ndarray:
+        bound = self.bind_parameters(params)
+        sv = Statevector(bound)
+        probs = cp.asarray(sv.probabilities())
+        return probs / (probs.sum() + 1e-12)
+
+# =============================================================================
+# TRAJECTORY EVALUATOR (FIX: Tsumego Logic & Gradient Saturation)
+# =============================================================================
+# =============================================================================
+# TRAJECTORY EVALUATOR (FIX: Tsumego Logic & Gradient Saturation + DEPTH 4)
+# =============================================================================
+    def _evaluate_trajectory(self, trajectory) -> float:
+        b = self.board.copy()
+        colors = [GoBoard.WHITE, GoBoard.BLACK, GoBoard.WHITE, GoBoard.BLACK]
+
+        # Analizziamo la prima mossa del Bianco PRIMA di giocarla
+        first_move = trajectory[0]
+        first_pos = coord_to_index(first_move, self.board.size)
+        r, c = divmod(first_pos, self.board.size)
+
+        # Conta i vicini neri della prima mossa sulla scacchiera INIZIALE
+        neighbors = get_neighbors(first_pos, self.board.size)
+        black_neighbors = sum(1 for n in neighbors if self.board.board[n // self.board.size, n % self.board.size] == GoBoard.BLACK)
+
+        # REGOLA DEL GO: Penalizza gli attachment pesanti (2+ vicini neri)
+        # F2 ha 2 vicini neri (F3, G2) -> Penalità alta
+        # E2 ha 1 vicino nero (E3) -> Nessuna penalità (è un placement)
+        attachment_penalty = 0.4 if black_neighbors >= 2 else 0.0
+
+        # Simula le 4 mosse
+        for i in range(min(len(trajectory), len(colors))):
+            move = trajectory[i]
+            color = colors[i]
+            pos = coord_to_index(move, b.size)
+            r, c = divmod(pos, b.size)
+            if b.board[r, c] != GoBoard.EMPTY:
+                continue
+            b.place_stone(move, color)
+
+        # 1. Check if Black group is captured
+        black_alive = False
+        group_positions = []
+        for coord in self.group:
+            pos = coord_to_index(coord, b.size)
+            r, c = divmod(pos, b.size)
+            if b.board[r, c] == GoBoard.BLACK:
+                black_alive = True
+                group_positions.append(pos)
+
+        if not black_alive:
+            return 1.0 - (attachment_penalty * 0.5) # Cattura, ma penalizza se fatta male
+
+        # 2. Count liberties
+        libs = len(b.get_group_liberties_coords(self.group))
+
+        # 3. Advanced Eye Space Analysis
+        group_set = set(group_positions)
+        eye_points = []
+
+        for pos in range(b.size * b.size):
+            r, c = divmod(pos, b.size)
+            if b.board[r, c] == GoBoard.EMPTY:
+                neighbors = get_neighbors(pos, b.size)
+                black_neighbors_eye = sum(1 for n in neighbors if n in group_set)
+                white_neighbors_eye = sum(1 for n in neighbors if b.board[n // b.size, n % b.size] == GoBoard.WHITE)
+
+                if black_neighbors_eye >= 2 and white_neighbors_eye == 0:
+                    eye_points.append(pos)
+
+        # 4. Simulare la risposta del Nero (può fare un occhio?)
+        black_can_make_eye = False
+        for pos in range(b.size * b.size):
+            r, c = divmod(pos, b.size)
+            if b.board[r, c] == GoBoard.EMPTY:
+                neighbors = get_neighbors(pos, b.size)
+                black_neighbors_eye = sum(1 for n in neighbors if b.board[n // b.size, n % b.size] == GoBoard.BLACK)
+                white_neighbors_eye = sum(1 for n in neighbors if b.board[n // b.size, n % b.size] == GoBoard.WHITE)
+                if black_neighbors_eye >= 3 and white_neighbors_eye == 0:
+                    black_can_make_eye = True
+                    break
+
+        # 5. Heuristic from WHITE's perspective
+        num_eyes = len(eye_points)
+
+        if num_eyes >= 2 and libs >= 2:
+            base_score = 0.0
+        elif black_can_make_eye:
+            base_score = 0.1
+        elif num_eyes >= 1 and libs >= 3:
+            base_score = 0.3
+        elif libs >= 4:
+            base_score = 0.5
+        else:
+            base_score = 0.9
+
+        # Applica la penalità per gli attachment
+        final_score = max(0.0, base_score - attachment_penalty)
+        return final_score
+# =============================================================================
+# WIDGET + OPTIMIZER
+# =============================================================================
+class TrainingWidget:
+    def __init__(self, moves):
+        self.moves = moves
+        self.progress = widgets.FloatProgress(value=0, min=0, max=100, description='Progress:')
+        self.label = widgets.Label(value="Step 0/0")
+        self.status = widgets.Label(value="Inizializzazione...")
+        display(widgets.VBox([widgets.HBox([self.progress, self.label]), self.status]))
+        self.out = widgets.Output()
+        display(self.out)
+        with self.out:
+            self.fig, self.ax = plt.subplots(figsize=(11, 5.5))
+
+    def update(self, step, total, probs, exp_val):
+        self.progress.value = (step + 1) / total * 100
+        self.label.value = f"Step {step+1}/{total}"
+        best = max(probs, key=probs.get)
+        self.status.value = f"Best: {best} ({probs[best]*100:.1f}%) | White Score: {exp_val:.4f}"
+
+        try:
+            with self.out:
+                clear_output(wait=True)
+                vals = [probs.get(m, 0) for m in self.moves]
+                self.ax.clear()
+                colors = ['gold' if v == max(vals) else 'steelblue' for v in vals]
+                self.ax.barh(self.moves, vals, color=colors)
+                self.ax.set_xlim(0, 1)
+                self.ax.set_title(f"White Score: {exp_val:.4f} | Step {step+1}")
+                plt.tight_layout()
+                plt.show()
+        except Exception:
+            pass
+
+    def close(self):
+        plt.close(self.fig)
+
+class GPUOptimizer:
+    def __init__(self, evaluator):
+        self.evaluator = evaluator
+
+    def optimize(self, steps=40, lr=0.05):
+        num_params = self.evaluator.born._num_params
+        theta = cp.random.uniform(0, np.pi, num_params, dtype=cp.float32)
+        widget = TrainingWidget(self.evaluator.candidate_moves)
+
+        beta1, beta2, eps_adam = 0.9, 0.999, 1e-8
+        m = cp.zeros_like(theta)
+        v = cp.zeros_like(theta)
+
+        shift = cp.pi / 2.0
+
+        for step in range(steps):
+            val = self.evaluator.expectation(theta)
+            grad = cp.zeros_like(theta)
+
+            for i in range(num_params):
+                plus = theta.copy(); plus[i] += shift
+                minus = theta.copy(); minus[i] -= shift
+                grad[i] = (self.evaluator.expectation(plus) - self.evaluator.expectation(minus)) / 2.0
+
+            m = beta1 * m + (1 - beta1) * grad
+            v = beta2 * v + (1 - beta2) * (grad ** 2)
+            m_hat = m / (1 - beta1 ** (step + 1))
+            v_hat = v / (1 - beta2 ** (step + 1))
+
+            theta += lr * m_hat / (cp.sqrt(v_hat) + eps_adam)
+            cp.get_default_memory_pool().free_all_blocks()
+
+            probs = self.evaluator.move_distribution(theta)
+            widget.update(step, steps, probs, float(val.get()))
+
+            if step % 5 == 0 or step == steps - 1:
+                best_move = max(probs, key=probs.get)
+                print(f"🔄 Step {step+1:2d}/{steps} | White Score: {float(val.get()):.4f} | Best: {best_move} ({probs[best_move]*100:.1f}%)")
+
+        widget.close()
+        return theta
+
+# =============================================================================
+# MAIN
+# =============================================================================
+def setup_problem():
+    board = GoBoard(9)
+    for s in ["G2","H2","E3","F3","H3"]:
+        board.place_stone(s, GoBoard.BLACK)
+    for s in ["C3","D4","E4","F4","G4","H4","G3"]:
+        board.place_stone(s, GoBoard.WHITE)
+    return board, ["G2","H2","E3","F3","H3"]
+
+def main():
+    if not os.path.exists('/content/drive/MyDrive'):
+        print("🔄 Montaggio Drive...")
+        drive.mount('/content/drive')
+    else:
+        print("✅ Drive già montato")
+
+    board, group = setup_problem()
+    print("\n=== SCACCHIERA ===")
+    print(board.render())
+
+    candidates = board.get_candidate_moves(group, expansion=2)
+    print(f"\n🎯 Mosse candidate smart: {len(candidates)}")
+    print(" ".join(candidates))
+
+    evaluator = TrajectoryEvaluator(board, group, depth=4, reps=2)
+    optimizer = GPUOptimizer(evaluator)
+
+    print("\n🚀 Inizio ottimizzazione...")
+    final_theta = optimizer.optimize(steps=40, lr=0.05)
+
+    probs = evaluator.move_distribution(final_theta)
+    best_move = max(probs, key=probs.get)
+
+    print("\n" + "="*80)
+    print(f"🎯 MIGLIOR MOSSA (BIANCO): {best_move} ({probs[best_move]*100:.1f}%)")
+    print("="*80)
+    for move, p in sorted(probs.items(), key=lambda x: -x[1])[:12]:
+        bar = '█' * int(p * 35)
+        print(f"{move:3s} | {bar} {p*100:5.1f}%")
+    print("="*80)
+
+if __name__ == "__main__":
+    main()
