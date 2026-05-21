@@ -131,7 +131,7 @@ class GoBoard:
             if pos in visited: continue
             r, c = divmod(pos, self.size)
             if self.board[r, c] == color:
-                group, _ = self._get_group(pos)
+                group, _ = self._get_group(pos)               
                 visited.update(group)
                 if self._count_liberties(group) == 0:
                     for g in group:
@@ -216,41 +216,102 @@ class CuQuantumBornTrajectoryCircuit:
     def probabilities(self, params: cp.ndarray) -> cp.ndarray:
         bound = self.bind_parameters(params)
         sv = Statevector(bound)
-        probs = cp.asarray(sv.probabilities())
+        # FIX: Slice probabilities to match the number of states (candidate moves)
+        probs = cp.asarray(sv.probabilities())[:self.num_states]
         return probs / (probs.sum() + 1e-12)
 
 # =============================================================================
-# TRAJECTORY EVALUATOR (FIX: Tsumego Logic & Gradient Saturation)
+# TRAJECTORY EVALUATOR (FIX: Tsumego Logic & Gradient SATURATION + DEPTH 4)
 # =============================================================================
-# =============================================================================
-# TRAJECTORY EVALUATOR (FIX: Tsumego Logic & Gradient Saturation + DEPTH 4)
-# =============================================================================
+class TrajectoryEvaluator:
+    def __init__(self, board: GoBoard, group: List[str], depth: int, reps: int):
+        self.board = board
+        self.group = group
+        self.depth = depth
+        self.candidate_moves = self.board.get_candidate_moves(self.group, expansion=2)
+        self.num_candidate_moves = len(self.candidate_moves)
+
+        if self.num_candidate_moves == 0:
+            raise ValueError("No candidate moves generated for the given group.")
+
+        self.born = CuQuantumBornTrajectoryCircuit(
+            num_states=self.num_candidate_moves,
+            reps=reps,
+            entanglement="linear"
+        )
+        self.move_to_index = {move: i for i, move in enumerate(self.candidate_moves)}
+        self.index_to_move = {i: move for i, move in enumerate(self.candidate_moves)}
+
+        logger.info(f"Generated {self.num_candidate_moves} candidate moves.")
+
+        # Precompute all possible trajectories up to 'depth'
+        self.all_trajectories = self._generate_all_trajectories()
+        self._trajectory_scores = {}
+        for traj in self.all_trajectories:
+            # Use a tuple for the key for hashability
+            self._trajectory_scores[tuple(traj)] = self._evaluate_trajectory(traj)
+        logger.info(f"Generated {len(self.all_trajectories)} trajectories for evaluation (depth={depth}) and precomputed scores.")
+
+    def _generate_all_trajectories(self) -> List[List[str]]:
+        # Generate all possible sequences of 'depth' moves from the candidate moves pool.
+        # This assumes _evaluate_trajectory can handle any sequence and will penalize invalid placements.
+        moves_pool = self.candidate_moves
+        trajectories = list(itertools.product(moves_pool, repeat=self.depth))
+        return [list(t) for t in trajectories]
+
+    def expectation(self, params: cp.ndarray) -> cp.ndarray:
+        probs_born = self.born.probabilities(params) # Probabilities for the *first* move (candidate moves)
+
+        move_scores_sum = cp.zeros(self.num_candidate_moves, dtype=cp.float32)
+        move_counts = cp.zeros(self.num_candidate_moves, dtype=cp.float32)
+
+        for traj_tuple, score in self._trajectory_scores.items():
+            first_move_str = traj_tuple[0]
+            first_move_idx = self.move_to_index[first_move_str]
+            move_scores_sum[first_move_idx] += score
+            move_counts[first_move_idx] += 1
+
+        # Calculate the average score for trajectories starting with each candidate move.
+        # A score of 0.0 is used if no trajectories start with a particular move (should not happen with itertools.product).
+        avg_scores_per_first_move = cp.where(move_counts > 0, move_scores_sum / move_counts, cp.array(0.0, dtype=cp.float32))
+
+        # The expected value is the weighted sum of these average scores, where weights are the probabilities from the Born machine.
+        expected_value = cp.sum(probs_born * avg_scores_per_first_move)
+
+        return expected_value
+
+    def move_distribution(self, params: cp.ndarray) -> Dict[str, float]:
+        probs_born = self.born.probabilities(params)
+        dist = {self.index_to_move[i]: float(probs_born[i]) for i in range(self.num_candidate_moves)}
+        return dist
+
     def _evaluate_trajectory(self, trajectory) -> float:
         b = self.board.copy()
         colors = [GoBoard.WHITE, GoBoard.BLACK, GoBoard.WHITE, GoBoard.BLACK]
 
-        # Analizziamo la prima mossa del Bianco PRIMA di giocarla
+        # Analyze the first White move BEFORE playing it
         first_move = trajectory[0]
         first_pos = coord_to_index(first_move, self.board.size)
-        r, c = divmod(first_pos, self.board.size)
 
-        # Conta i vicini neri della prima mossa sulla scacchiera INIZIALE
+        # Count black neighbors of the first move on the INITIAL board
         neighbors = get_neighbors(first_pos, self.board.size)
         black_neighbors = sum(1 for n in neighbors if self.board.board[n // self.board.size, n % self.board.size] == GoBoard.BLACK)
 
-        # REGOLA DEL GO: Penalizza gli attachment pesanti (2+ vicini neri)
-        # F2 ha 2 vicini neri (F3, G2) -> Penalità alta
-        # E2 ha 1 vicino nero (E3) -> Nessuna penalità (è un placement)
+        # GO RULE: Penalize heavy attachments (2+ black neighbors)
+        # F2 has 2 black neighbors (F3, G2) -> High penalty
+        # E2 has 1 black neighbor (E3) -> No penalty (it's a placement)
         attachment_penalty = 0.4 if black_neighbors >= 2 else 0.0
 
-        # Simula le 4 mosse
+        # Simulate the 'depth' moves (max 4 moves as per original 'colors' list)
         for i in range(min(len(trajectory), len(colors))):
             move = trajectory[i]
             color = colors[i]
             pos = coord_to_index(move, b.size)
             r, c = divmod(pos, b.size)
             if b.board[r, c] != GoBoard.EMPTY:
-                continue
+                # If an illegal move is attempted (placing on occupied spot), penalize White heavily.
+                # A score of 0.0 means terrible for White.
+                return 0.0
             b.place_stone(move, color)
 
         # 1. Check if Black group is captured
@@ -264,12 +325,14 @@ class CuQuantumBornTrajectoryCircuit:
                 group_positions.append(pos)
 
         if not black_alive:
-            return 1.0 - (attachment_penalty * 0.5) # Cattura, ma penalizza se fatta male
+            # Black's original group is captured. This is good for White, so a high score.
+            # Penalize slightly if the capture involved a heavy attachment (White played badly).
+            return 1.0 - (attachment_penalty * 0.5) # Max score 1.0 (best for White), reduced if attachment bad.
 
-        # 2. Count liberties
+        # 2. Count liberties of the original black group after all moves
         libs = len(b.get_group_liberties_coords(self.group))
 
-        # 3. Advanced Eye Space Analysis
+        # 3. Advanced Eye Space Analysis (for the original black group)
         group_set = set(group_positions)
         eye_points = []
 
@@ -283,7 +346,7 @@ class CuQuantumBornTrajectoryCircuit:
                 if black_neighbors_eye >= 2 and white_neighbors_eye == 0:
                     eye_points.append(pos)
 
-        # 4. Simulare la risposta del Nero (può fare un occhio?)
+        # 4. Simulate Black's response (can Black make an eye?)
         black_can_make_eye = False
         for pos in range(b.size * b.size):
             r, c = divmod(pos, b.size)
@@ -295,23 +358,24 @@ class CuQuantumBornTrajectoryCircuit:
                     black_can_make_eye = True
                     break
 
-        # 5. Heuristic from WHITE's perspective
+        # 5. Heuristic from WHITE's perspective (Higher score means better for White)
         num_eyes = len(eye_points)
 
         if num_eyes >= 2 and libs >= 2:
-            base_score = 0.0
+            base_score = 0.0 # Black is very safe, very bad for White
         elif black_can_make_eye:
-            base_score = 0.1
+            base_score = 0.1 # Black can make an eye, bad for White
         elif num_eyes >= 1 and libs >= 3:
-            base_score = 0.3
+            base_score = 0.3 # Slightly better for White
         elif libs >= 4:
-            base_score = 0.5
+            base_score = 0.5 # Neutral for White
         else:
-            base_score = 0.9
+            base_score = 0.9 # Black is in trouble, good for White
 
-        # Applica la penalità per gli attachment
+        # Apply the attachment penalty: If White made a heavy attachment, their score is reduced.
         final_score = max(0.0, base_score - attachment_penalty)
         return final_score
+
 # =============================================================================
 # WIDGET + OPTIMIZER
 # =============================================================================
@@ -428,7 +492,7 @@ def main():
     best_move = max(probs, key=probs.get)
 
     print("\n" + "="*80)
-    print(f"🎯 MIGLIOR MOSSA (BIANCO): {best_move} ({probs[best_move]*100:.1f}%)")
+    print(f"🎯 MIGLIOR MOSSA (BIANCO): {best_move} ({probs[best_move]*100:.1f}%) ")
     print("="*80)
     for move, p in sorted(probs.items(), key=lambda x: -x[1])[:12]:
         bar = '█' * int(p * 35)
